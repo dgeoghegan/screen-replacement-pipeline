@@ -1,154 +1,164 @@
-# AutoHDR TV Screen Replacement Pipeline
+# Constrained Perception Pipeline for Screen Replacement in Unstructured Images
 
-A Python pipeline that detects TV screens in real estate photos and replaces them with a provided image. Built as a take-home project for AutoHDR.
+This was a Friday-to-Monday take-home. I had not done image processing before, had not integrated a vision model into an automated pipeline, and had done little beyond tinkering in Python. The goal was to detect TV screens in photographs and replace them with a provided image.
 
----
-
-## What It Does
-
-Given a folder of source images, the pipeline:
-
-1. Detects TV screen candidates using Gemini Vision
-2. Crops the detected region and uses OpenCV to find the screen quadrilateral
-3. Draws a pink highlight around the candidate quad and sends the full image back to Gemini to confirm it's actually a TV
-4. If confirmed, warps the replacement image to fit the detected screen geometry using a perspective transform
-5. Evaluates the final output with a third Gemini pass before saving
-6. Logs token usage, per-image results, and run summaries throughout
-
-```bash
-python run.py --input_dir ./input_images --output_dir ./output_images
-```
+The results are imperfect. This document describes what I built, how I reasoned about it, and what I would change.
 
 ---
 
-## How to Build and Run
+## System Model
 
-### Requirements
+This is a staged perception and validation pipeline that transforms unstructured images into constrained geometric modifications. Each stage reduces uncertainty through either deterministic computation (OpenCV) or probabilistic validation (YOLO / Gemini), with full traceability of intermediate states.
+
+---
+
+## What I Built First
+
+The system was designed around a constraint: no improvement step is valid unless it is observable and measurable. Instrumentation—logging, mocking, ground truth scoring, and parallel execution—was implemented first to ensure all later changes could be evaluated against traceable system state.
+
+The commit history reflects this order. Days one and two focused on pipeline structure, module separation, a mock mode for testing without API calls, and an IoU scoring system built from pixel-diffing the provided src/tar image pairs. Accuracy work came after.
+
+Visual observability was part of the same investment. Every stage writes its intermediate state to disk as an image: YOLO detections with candidates annotated, the crop passed to Gemini, the OpenCV edge map under the selected lighting preset, and the highlighted quad sent for confirmation. Failures can be traced to a specific stage without debugging or rerunning the pipeline.
+
+I would make the same call again.
+
+---
+
+## How It Works
+
+Each image is processed through a fixed-stage pipeline where each step reduces uncertainty before transformation is applied.
+
+### 1. Detection
+YOLO scans the full image for TVs (class 62). If confidence exceeds a threshold, the bounding box is padded and passed forward. If YOLO finds nothing, Gemini is used as a fallback on the full image.
+
+### 2. Classification
+The detected region is sent to Gemini, which determines:
+- whether a TV is present
+- the lighting condition (standard, bright reflection, sharp angle, dim lighting, partial occlusion)
+
+Images without a confirmed TV are skipped.
+
+### 3. Quad Detection
+The crop is processed with OpenCV edge detection using Canny parameters tuned per lighting preset. Contours are filtered by area and approximated to quadrilaterals, then mapped back to full-image coordinates.
+
+The goal is recovering screen corners, not bounding boxes, which is necessary for correct perspective warping.
+
+### 4. Confirmation
+A highlighted candidate quad is sent to Gemini for validation. It rejects cases with diagonal artifacts, furniture anchoring, or incomplete boundaries.
+
+If OpenCV candidates fail, Gemini is asked directly for quad coordinates.
+
+### 5. Replacement
+The confirmed quad defines a perspective transform. The replacement image is warped and composited into the original image.
+
+Each image is retried up to five times before failure.
+
+---
+
+## Key Decisions
+
+YOLO is used for detection with Gemini as fallback. YOLO handles most cases at low cost; Gemini covers edge cases. Reversing this would be too expensive at scale.
+
+OpenCV is used for geometry instead of relying on Gemini bounding boxes. Bounding boxes are insufficient under perspective distortion. Lighting presets adjust contour sensitivity, including epsilon for polygon approximation.
+
+A confirmation step is used before committing any geometry. This adds API cost but significantly reduces invalid placements.
+
+Parallel workers were added mid-project to reduce iteration time. This was a development constraint, not an accuracy change.
+
+A Gemini-based post-placement evaluator was built and later disabled. It lacked ground-truth geometric context and produced low-signal feedback relative to cost.
+
+---
+
+## Results and Metrics
+
+Two metrics are tracked:
+
+**success_pct**  
+Process metric: any image where a quad was produced and a replacement saved. Includes incorrect placements.
+
+**true_success_rate**  
+Quality metric: IoU ≥ 0.5 against ground truth or correct skip of no-TV images.
+
+Ground truth is generated via pixel-diffing of src/tar pairs to infer placement regions.
+
+Coverage is incomplete. Some correct placements are not scored, leading to systematic undercounting.
+
+Manual inspection suggests approximately ~85% correctness, though this is not fully verifiable due to ground truth limitations.
+
+If ground truth coverage were complete, true_success_rate would be the primary metric.
+
+---
+
+## Failure Model
+
+### Geometric Failures
+Occasionally produces skewed or triangular outputs when non-convex contours are selected (often caused by reflections). A convexity check (`cv2.isContourConvex`) would prevent this class of error.
+
+### Aspect Ratio Mismatch
+Fixed replacement image leads to distortion when screen aspect ratios diverge significantly. Cropping the replacement prior to warping would correct this.
+
+### Debug Artifact Leakage
+Intermediate outputs (crops, edge maps, overlays) are written unconditionally to disk. These should be gated behind a debug flag.
+
+---
+
+## How to Run
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export GEMINI_API_KEY=your_key_here
+````
+
+Place replacement image:
+
+```
+./assets/replacement.jpg
 ```
 
-### Environment Variables
-
-| Variable | Description |
-|---|---|
-| `GEMINI_API_KEY` | Required. Gemini API key. |
-
-Set it before running:
+Run pipeline:
 
 ```bash
-export GEMINI_API_KEY=your_key_here
+python run.py --input_dir ./input_images --output_dir ./output_images --workers <N>
 ```
-
-### CLI Flags
-
-| Flag | Description |
-|---|---|
-| `--input_dir` | Required. Directory of source images. |
-| `--output_dir` | Required. Directory for output images. |
-| `--mock` | Use mock Gemini responses instead of real API calls. Useful for testing pipeline logic without burning tokens. |
-| `--tv_noconfirm` | Only meaningful with `--mock`. Forces the TV confirmation step to return no, for testing rejection logic. |
 
 ---
 
-## Architecture
+## Flags
 
-### Module Structure
+| Flag             | Description                                            |
+| ---------------- | ------------------------------------------------------ |
+| `--input_dir`    | Source images directory (required)                     |
+| `--output_dir`   | Output directory (required)                            |
+| `--workers`      | Parallel workers (default: 1)                          |
+| `--evaluate`     | Gemini post-placement evaluation (disabled by default) |
+| `--mock`         | Mock Gemini responses                                  |
+| `--tv_noconfirm` | Force rejection in mock mode                           |
+| `--compare`      | IoU evaluation against ground truth                    |
 
-```
-run.py      # Thin orchestrator. Argparse, loop, nothing else.
-detector.py      # All Gemini interactions for detection and confirmation.
-processor.py     # All OpenCV work: cropping, quad detection, compositing.
-evaluator.py     # Post-replacement quality check via Gemini.
-ingestor.py      # Image discovery and path validation.
-logger.py        # Structured logging: tokens, per-image results, run summaries.
-gemini.py        # Low-level Gemini API client and exception hierarchy.
-mock_gemini.py   # Drop-in mock with fixture payloads for each pipeline stage.
-```
+---
 
-Dependency direction is one-way: `pipeline` → `detector/processor/evaluator` → `gemini/ingestor` → nothing. No module imports from a layer above it.
+## Module Structure
 
-### Detection Strategy
+* `run.py` — orchestration, threading, IoU scoring, stats logging
+* `detector.py` — YOLO detection, Gemini fallback, classification, quad detection, confirmation loop
+* `processor.py` — edge detection, contour filtering, perspective transform
+* `evaluator.py` — optional Gemini-based evaluation (disabled)
+* `ingestor.py` — image loading
+* `gemini.py` — API wrapper
+* `logger.py` — JSONL logging for runs and tokens
+* `mock_gemini.py` — deterministic test fixtures
 
-Gemini Vision is the primary detection mechanism. It receives the full source image and returns bounding boxes (normalized 0-1000) for TV candidates, along with confidence scores and reasoning.
+Development tools (unsupported): `test_run.py`, `analyze_runs.py`, `analyze_image_costs.py`, `extract_ground_truth.py`.
 
-### The Confirmation Loop
-
-After Gemini returns a bounding box, OpenCV crops the region, detects quadrilateral contours, and finds screen candidates. For each candidate, the quad is drawn in pink on the full source image and sent back to Gemini with the question: "is this highlighted region a complete television screen?"
-
-This second pass catches false positives (fireplaces, reflections, artwork) and partial detections. Only confirmed quads proceed to replacement.
-
-### Perspective Transform
-
-The replacement image is warped to fit the detected quadrilateral using `cv2.getPerspectiveTransform`. Quad points are sorted into consistent top-left, top-right, bottom-right, bottom-left order before the transform to prevent rotation artifacts. The result is composited back onto the original image at full resolution.
-
-### Evaluation Before Save
-
-The pipeline evaluates the composited image with a third Gemini call before writing it to disk. If Gemini determines the replacement was not correctly applied, the output is discarded rather than saved. This keeps the output directory clean and provides a signal for the accuracy metric.
-
-### Mocking
-
-Every external dependency has a mock. `mock_gemini.py` contains fixture payloads for each stage: initial detection, TV confirmation (yes/no/uncertain), and evaluation (success/failure). The `--mock` flag swaps real API calls for fixtures end-to-end, allowing the full pipeline to run without network access or token spend.
+Dependency direction is strictly one-way:
+`run → detector/processor/evaluator → gemini/ingestor`
 
 ---
 
 ## Logging
 
-Three log files are written to `logs/`:
-
-**`token_usage.jsonl`** — one record per Gemini API call, with token counts and a `run_id` for aggregation.
-
-**`image_results.jsonl`** — one record per image per run, with status (`success`, `no_tv_detected`, `evaluation_failed`, `gemini_error`, `cv2_no_quad`) and a failure reason where applicable.
-
-**`run_summary.jsonl`** — one record per run, with aggregate counts, total tokens, and runtime.
-
-Token counts are aggregated by `run_id` at the end of each run rather than being passed up through the call stack. This is a pragmatic tradeoff — threading counts through `detect_tvs` → `confirm_tv` → `evaluate_result` would be cleaner but was too invasive given time constraints. A comment in the code marks where this should be refactored.
-
----
-
-## Failure Modes
-
-**Gemini's bounding boxes are inconsistent run-to-run on the same image. The confirmation loop catches most bad boxes: a poor localization produces a quad Gemini won't confirm. Failed images are logged and skipped rather than retried.
-
-**OpenCV quad sensitivity.** cv2 contour detection is sensitive to lighting, contrast, and competing edges in the crop. High-noise crops (angled ceilings, complex furniture) can produce zero quad candidates or pick the wrong contour. The confirmation step catches most of these, but some images will produce no confirmed quad.
-
-**Partial TV crops.** If Gemini's bounding box clips the TV, OpenCV works with an incomplete outline. Bbox padding (configurable via `BBOX_PADDING_PIX`) reduces this, but large localization errors can't be recovered without a retry.
-
-**Occlusion.** TVs partially obscured by plants, furniture, or people will confuse both Gemini localization and cv2 contour detection. This is expected to be a small percentage of the dataset and is not currently handled.
-
-**Confounders.** Fireplaces, windows, mirrors, and appliance displays can be mistaken for TVs. The detection prompt explicitly names these, and the confirmation prompt requires a complete TV screen. The combination handles most cases.
-
----
-
-## Production Considerations
-
-These are design decisions for a production deployment. None of this is built.
-
-**Queuing.** At scale, put an SQS queue in front of an ECS service and autoscale on queue depth. The pipeline is stateless by design (no local writes during execution except explicit output artifacts), which makes this straightforward. The rough architecture would be: S3 → SQS → ECS → S3/RDS.
-
-**Scaling surfaces.** Ingestion, Gemini inference, and output writing scale independently. Gemini calls are the bottleneck because they're sequential per image right now. Concurrent processing with bounded parallelism (asyncio or a thread pool) would be the first optimization.
-
-**Kubernetes.** Not the right call yet. ECS or Cloud Run is appropriate at this stage. Kubernetes becomes worth the operational overhead when you have multiple services with different scaling profiles that need independent deployment. A modular monolith that's proven its seams is the right precondition for that conversation.
-
-**Model evolution.** Gemini 2.5 Flash is the current model. If accuracy plateaus before 95%, the next step is fine-tuning a domain-specific model on AutoHDR's labeled dataset rather than continuing to prompt-engineer a general model. The pluggable detection strategy interface is designed to make this swap clean.
-
-**Retry loop.** Detection and confirmation should retry up to N times per image, with a fresh Gemini call each attempt. Gemini's bounding box variability means a second attempt often produces a better result. This is the highest-priority unbuilt feature for accuracy improvement.
-
----
-
-## What Was Not Built and Why
-
-**Retry loop.** The most impactful missing feature. Architecture supports it — `detect_tvs` would loop up to a configurable max, returning on first confirmed detection. Not built due to time, not due to complexity.
-
-**Containerization.** `requirements.txt` is the source of truth for dependencies. A Dockerfile is straightforward given the stateless design. Not built yet.
-
-**Ground truth accuracy measurement.** The S3 bucket contains before/after pairs (`_src` and `_tar`). A ground truth JSON mapping filenames to expected outcomes would allow automated accuracy scoring against those pairs. The evaluation step produces a per-image signal; the aggregation layer is not built.
-
-**Unit tests.** The mock infrastructure is in place. pytest tests for `_descale_bbox`, `sort_quad_points`, `discover_images`, and the exception hierarchy are the obvious starting points. Not written yet.
-
-**Bezel-aware placement.** The replacement image currently fills the full detected quad including bezel. Nudging quad points slightly inward toward the centroid before compositing would preserve the bezel. One-line change, not yet done.
-
-**Lighting normalization.** The replacement image is pasted without color grading to match room lighting. A post-processing step to match luminance could improve realism. Not in scope for this project.
+* `token_usage.jsonl` — per-call API usage
+* `image_results.jsonl` — per-image outcomes and IoU
+* `run_summary.jsonl` — aggregated run statistics
