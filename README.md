@@ -1,4 +1,4 @@
-# Constrained Perception Pipeline for Screen Replacement in Unstructured Images
+# Screen Detection and Replacement Pipeline
 
 This was a Friday-to-Monday take-home. I had not done image processing before, had not integrated a vision model into an automated pipeline, and had done little beyond tinkering in Python. The goal was to detect TV screens in photographs and replace them with a provided image.
 
